@@ -1,0 +1,327 @@
+---
+title: "单病种6-9月数据分析-for paper"
+author: "xvyingrui"
+date: "2018年3月28日"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+单病种政策在于2017年上半年实施，2017年6月-9月为实施期间，该数据为实施期间发生的病种数据~
+同时，广州政府在2017年7月15号实施了药品零加成，同时也调整了医疗服务项目的价格，并次打算通过以7月15号作为时间间隔点，对政策实施前后进行数据分析~
+通过对该数据进行数据分析、数据挖掘，挖掘政策改变医院行为、医生相关治疗方法行为的改变。
+
+###链接
+[点击查看MARKDOWN教程](https://www.cnblogs.com/nxld/p/6074412.html)
+
+
+```{r message=FALSE}
+#加载相关的包
+library(forecast)
+library(tidyverse)
+library(readxl)
+library(knitr)
+library(stringr)
+ library(readr)
+library(ggthemr)
+ggthemr('solarized')
+```
+
+
+#导入相关数据
+住院结果数据表示，该部分患者的费用在单病种支付标准的0.5以下，和2倍以上，按照服务项目给予报销。
+单病种结果数据表示，该部分患者的费用在单病种支付标准的0.5~2倍之间，按照单病种支付标准进行费用支付。
+
+
+```{r message=FALSE,warning=FALSE,error=FALSE}
+#6-9月份住院结果数据
+zy_wqc <- read_csv("H:/data/SD-0328ANA/6789zy1021_wqc1.csv")
+
+#6-9月份单病种结果数据
+dbz_qc <- read_csv("h:/data/SD-0328ANA/6789qc1016.1.csv")
+
+```
+
+
+查看数据的基本其情况
+
+```{r}
+
+cbind(names(zy_wqc),names(dbz_qc))%>%kable()
+kable(sapply(zy_wqc,function(x){sum(is.na(x))}))
+kable(sapply(dbz_qc,function(x){sum(is.na(x))}))
+```
+
+
+
+
+
+#数据处理
+
+
+
+
+##一、对数据进行预处理病进行单病种结果和住院结果合并
+```{r}
+#处理医院ID
+zy_wqc$hospitalid=paste0("'",str_extract_all(zy_wqc$HOSPITAL,"[0-9]+[0-9]"))
+zy_wqc$id=paste0("'",str_extract_all(zy_wqc$ID,"[0-9]+[0-9]"))
+zy_wqc1=zy_wqc%>%
+  select(-HOSPITAL,-ID)%>%
+  rename(HOSPITAL=hospitalid,ID=id)%>%
+  group_by(ID)%>%
+  filter(row_number()==1)%>%
+  ungroup()
+
+zy_dbz_qc=rbind(zy_wqc1,dbz_qc)
+
+
+
+```
+
+##二、去除缺失值
+###缺失值的原因是，该部分数据只有病种没有术式，因此在病种数据中，没办法匹配到支付标准，所以这部分数据选择去掉
+
+```{r warning=FALSE}
+zy_dbz_qc1=zy_dbz_qc[!is.na(zy_dbz_qc$三级医院标准),]
+zy_dbz_qc1[is.na(zy_dbz_qc1)]<-"行鼻内窥镜手术治疗"
+kable(sapply(zy_dbz_qc1,function(x){sum(is.na(x))}))
+
+sum(is.na(zy_dbz_qc1))
+
+```
+
+##deal with the time data
+###choose the INDATE as the beginning time
+###在这部分数据中，因为政策是在7月15号颁布的，所以会对该时间点前后的住院患者的费用结构，医生行为有一定的影响。
+```{r}
+
+zy_dbz_qc1$date1=as.Date(substr(zy_dbz_qc1$INDATE,1,10))
+zy_dbz_qc1$date1_month=substr(zy_dbz_qc1$INDATE,1,7)
+
+table(zy_dbz_qc1$date1_month)
+zy_dbz_qc1$date1_week=cut(zy_dbz_qc1$date1,breaks = "week")
+sum(is.na(zy_dbz_qc1))
+table(zy_dbz_qc1$date1_week)%>%as.data.frame()%>%kable()
+
+names(zy_dbz_qc1)%>%as.data.frame()%>%kable()
+
+str(zy_dbz_qc1)
+
+
+zy_dbz_qc1[,24:40]=lapply(zy_dbz_qc1[,24:40],function(x){as.numeric(x)})
+
+kable(sapply(zy_dbz_qc1,function(x){sum(is.na(x))}))
+
+sum(is.na(zy_dbz_qc1))
+
+zy_dbz_qc1=na.omit(zy_dbz_qc1)
+sum(is.na(zy_dbz_qc1))
+
+```
+
+
+###对于5月份以前的数据进行剔除，留下20170501——20170925的数据作为时间序列模型数据
+###以每周作为一个时间节点进行拟合时间序列模型
+####1、对于拟合变量，首先对所有病种进行统计药占比，然后对所有病种的药占比进行统计描述，考虑去除异常值
+####2、汇总所有病种的药占比，统一为时间序列分析所需数据
+
+
+##1按照时间、诊断加术式统计药品费用占比
+```{r}
+
+
+zy_dbz_qc2=zy_dbz_qc1%>%
+  group_by(date1_week,诊断加术式)%>%
+  summarise(总费用=sum(TOTALFEE),例数=n(),                   ######总费用的计算
+               总计账金额总费用=sum(总记账金额),床位费=sum(BEDFEE),中药费=sum(CMEDFEE),
+               中草药费=sum(HERBFEE),治疗费=sum(TREATFEE),手术费=sum(OPERFEE),输血费=sum(BLOODFEE),
+               其他费=sum(OTHERFEE),材料费=sum(MATERFEE),特殊治疗费=sum(SPETRFEE),西药费=sum(WESTFEE),
+               中成药费=sum(CPATFEE),检查费=sum(EXAMFEE),放射费=sum(RADIAFEE),化验费=sum(LABFEE),
+               输氧费=sum(OXYGFEE),麻醉费=sum(ANESTFEE),特殊检查费=sum(SPEEXFEE))%>%
+    mutate(每例总费用=总费用/例数,每例总计账金额总费用=总计账金额总费用/例数,床位费占比=床位费/总费用,中药费占比=中药费/总费用,
+              中草药费占比=中草药费/总费用,治疗费占比=治疗费/总费用,手术费占比=手术费/总费用,
+              输血费占比=输血费/总费用,其他费占比=其他费/总费用,材料费占比=材料费/总费用,特殊治疗费占比=特殊治疗费/总费用,
+              西药费占比=西药费/总费用,中成药费占比=中成药费/总费用,检查费占比=检查费/总费用,放射费占比=放射费/总费用,
+              化验费占比=化验费/总费用,输氧费占比=输氧费/总费用,麻醉费占比=麻醉费/总费用,特殊检查费占比=特殊检查费/总费用,
+              例均药品费用=(中草药费+中药费+西药费+中成药费)/例数,例均检查费用=(检查费+放射费+化验费+特殊检查费)/例数,
+              例均手术及治疗费=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/例数,
+              例均材料及其他费=(床位费+其他费+材料费)/例数,           ###例均费用的计算
+              药品费用占比=(中草药费+中药费+西药费+中成药费)/总费用,检查费用占比=(检查费+放射费+化验费+特殊检查费)/总费用,
+              手术及治疗费占比=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/总费用,
+              材料及其他费占比=(床位费+其他费+材料费)/总费用)            ###费用占比的计算
+
+```
+
+
+###对时间、试点医院进行分割
+
+```{r}
+
+
+#导入试点公立医院ID
+library(readxl)
+hospitalid <- read_excel("h:/data/SD-0328ANA/hospitalid.xlsx")
+hospitalid$HOSPITAL=paste0("'",hospitalid$HOSPITAL)
+
+zy_dbz_qc3=merge(zy_dbz_qc1,hospitalid,by="HOSPITAL")
+
+
+zy_dbz_qc3=zy_dbz_qc3%>%
+  filter(定点医疗机构名称!="中国人民武装警察部队广东省总队医院")
+
+
+zy_dbz_qc4=zy_dbz_qc3%>%
+  group_by(就医序列号,ICD10,ID,OUTDATE,TOTALFEE,INDATE)%>%
+  filter(row_number()==1)%>%
+  ungroup()%>%
+  mutate(医院类别="试点公立")
+head(zy_dbz_qc4)
+
+```
+
+
+```{r}
+
+#私立医院
+
+zy_dbz_sl=anti_join(zy_dbz_qc1,hospitalid,by="HOSPITAL")
+
+x1_67_id2_sl_qc=zy_dbz_sl%>%
+  group_by(就医序列号,ICD10,ID,OUTDATE,TOTALFEE,INDATE)%>%
+  filter(row_number()==1)%>%
+  ungroup()%>%
+  mutate(医院类别="非试点医院",定点医疗机构名称="没数据")
+
+zy_dbz_hb=rbind(zy_dbz_qc4,x1_67_id2_sl_qc)
+
+
+```
+
+```{r}
+
+  zy_dbz_hb2=zy_dbz_hb%>%
+  group_by(date1_week,诊断加术式,医院类别)%>%
+  summarise(总费用=sum(TOTALFEE),例数=n(),                   ######总费用的计算
+               总计账金额总费用=sum(总记账金额),床位费=sum(BEDFEE),中药费=sum(CMEDFEE),
+               中草药费=sum(HERBFEE),治疗费=sum(TREATFEE),手术费=sum(OPERFEE),输血费=sum(BLOODFEE),
+               其他费=sum(OTHERFEE),材料费=sum(MATERFEE),特殊治疗费=sum(SPETRFEE),西药费=sum(WESTFEE),
+               中成药费=sum(CPATFEE),检查费=sum(EXAMFEE),放射费=sum(RADIAFEE),化验费=sum(LABFEE),
+               输氧费=sum(OXYGFEE),麻醉费=sum(ANESTFEE),特殊检查费=sum(SPEEXFEE))%>%
+    mutate(每例总费用=总费用/例数,每例总计账金额总费用=总计账金额总费用/例数,床位费占比=床位费/总费用,中药费占比=中药费/总费用,
+              中草药费占比=中草药费/总费用,治疗费占比=治疗费/总费用,手术费占比=手术费/总费用,
+              输血费占比=输血费/总费用,其他费占比=其他费/总费用,材料费占比=材料费/总费用,特殊治疗费占比=特殊治疗费/总费用,
+              西药费占比=西药费/总费用,中成药费占比=中成药费/总费用,检查费占比=检查费/总费用,放射费占比=放射费/总费用,
+              化验费占比=化验费/总费用,输氧费占比=输氧费/总费用,麻醉费占比=麻醉费/总费用,特殊检查费占比=特殊检查费/总费用,
+              例均药品费用=(中草药费+中药费+西药费+中成药费)/例数,例均检查费用=(检查费+放射费+化验费+特殊检查费)/例数,
+              例均手术及治疗费=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/例数,
+              例均材料及其他费=(床位费+其他费+材料费)/例数,           ###例均费用的计算
+              药品费用占比=(中草药费+中药费+西药费+中成药费)/总费用,检查费用占比=(检查费+放射费+化验费+特殊检查费)/总费用,
+              手术及治疗费占比=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/总费用,
+              材料及其他费占比=(床位费+其他费+材料费)/总费用)            ###费用占比的计算
+
+
+table(zy_dbz_hb$date1_week,zy_dbz_hb$医院类别)
+
+
+```
+
+
+```{r}
+
+zy_dbz_hb3=zy_dbz_hb%>%
+  group_by(date1_week,医院类别)%>%
+  summarise(总费用=sum(TOTALFEE),例数=n(),                   ######总费用的计算
+               总计账金额总费用=sum(总记账金额),床位费=sum(BEDFEE),中药费=sum(CMEDFEE),
+               中草药费=sum(HERBFEE),治疗费=sum(TREATFEE),手术费=sum(OPERFEE),输血费=sum(BLOODFEE),
+               其他费=sum(OTHERFEE),材料费=sum(MATERFEE),特殊治疗费=sum(SPETRFEE),西药费=sum(WESTFEE),
+               中成药费=sum(CPATFEE),检查费=sum(EXAMFEE),放射费=sum(RADIAFEE),化验费=sum(LABFEE),
+               输氧费=sum(OXYGFEE),麻醉费=sum(ANESTFEE),特殊检查费=sum(SPEEXFEE))%>%
+    mutate(每例总费用=总费用/例数,每例总计账金额总费用=总计账金额总费用/例数,床位费占比=床位费/总费用,中药费占比=中药费/总费用,
+              中草药费占比=中草药费/总费用,治疗费占比=治疗费/总费用,手术费占比=手术费/总费用,
+              输血费占比=输血费/总费用,其他费占比=其他费/总费用,材料费占比=材料费/总费用,特殊治疗费占比=特殊治疗费/总费用,
+              西药费占比=西药费/总费用,中成药费占比=中成药费/总费用,检查费占比=检查费/总费用,放射费占比=放射费/总费用,
+              化验费占比=化验费/总费用,输氧费占比=输氧费/总费用,麻醉费占比=麻醉费/总费用,特殊检查费占比=特殊检查费/总费用,
+              例均药品费用=(中草药费+中药费+西药费+中成药费)/例数,例均检查费用=(检查费+放射费+化验费+特殊检查费)/例数,
+              例均手术及治疗费=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/例数,
+              例均材料及其他费=(床位费+其他费+材料费)/例数,           ###例均费用的计算
+              药品费用占比=(中草药费+中药费+西药费+中成药费)/总费用,检查费用占比=(检查费+放射费+化验费+特殊检查费)/总费用,
+              手术及治疗费占比=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/总费用,
+              材料及其他费占比=(床位费+其他费+材料费)/总费用)            ###费用占比的计算
+
+
+table1=zy_dbz_hb3[,c("date1_week",'医院类别','药品费用占比')]
+
+ggplot(data = zy_dbz_hb3,aes(x=date1_week,y=药品费用占比,color=医院类别))+geom_point()
+
+```
+
+
+```{r}
+  zy_dbz_hb4=zy_dbz_hb%>%
+  group_by(诊断加术式)%>%
+  summarise(总费用=sum(TOTALFEE),例数=n(),                   ######总费用的计算
+               总计账金额总费用=sum(总记账金额),床位费=sum(BEDFEE),中药费=sum(CMEDFEE),
+               中草药费=sum(HERBFEE),治疗费=sum(TREATFEE),手术费=sum(OPERFEE),输血费=sum(BLOODFEE),
+               其他费=sum(OTHERFEE),材料费=sum(MATERFEE),特殊治疗费=sum(SPETRFEE),西药费=sum(WESTFEE),
+               中成药费=sum(CPATFEE),检查费=sum(EXAMFEE),放射费=sum(RADIAFEE),化验费=sum(LABFEE),
+               输氧费=sum(OXYGFEE),麻醉费=sum(ANESTFEE),特殊检查费=sum(SPEEXFEE))%>%
+    mutate(每例总费用=总费用/例数,每例总计账金额总费用=总计账金额总费用/例数,床位费占比=床位费/总费用,中药费占比=中药费/总费用,
+              中草药费占比=中草药费/总费用,治疗费占比=治疗费/总费用,手术费占比=手术费/总费用,
+              输血费占比=输血费/总费用,其他费占比=其他费/总费用,材料费占比=材料费/总费用,特殊治疗费占比=特殊治疗费/总费用,
+              西药费占比=西药费/总费用,中成药费占比=中成药费/总费用,检查费占比=检查费/总费用,放射费占比=放射费/总费用,
+              化验费占比=化验费/总费用,输氧费占比=输氧费/总费用,麻醉费占比=麻醉费/总费用,特殊检查费占比=特殊检查费/总费用,
+              例均药品费用=(中草药费+中药费+西药费+中成药费)/例数,例均检查费用=(检查费+放射费+化验费+特殊检查费)/例数,
+              例均手术及治疗费=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/例数,
+              例均材料及其他费=(床位费+其他费+材料费)/例数,           ###例均费用的计算
+              药品费用占比=(中草药费+中药费+西药费+中成药费)/总费用,检查费用占比=(检查费+放射费+化验费+特殊检查费)/总费用,
+              手术及治疗费占比=(治疗费+手术费+特殊治疗费+输氧费+麻醉费+输血费)/总费用,
+              材料及其他费占比=(床位费+其他费+材料费)/总费用)            ###费用占比的计算
+
+```
+
+###特征筛选
+```{r}
+#使用占比作为分类的标签
+
+zy_dbz_jl=zy_dbz_hb4%>%
+  select(contains('占比'),诊断加术式)
+
+data1=zy_dbz_jl[,-22]
+dist.e=dist(data1,method = 'euclidean')
+
+heatmap(as.matrix(dist.e),labRow = F, labCol = F)
+
+```
+
+
+```{r}
+
+model1=hclust(dist.e,method='ward')
+result=cutree(model1,k=3)
+
+mds=cmdscale(dist.e,k=2,eig=T)
+x = mds$points[,1]
+y = mds$points[,2]
+library(ggplot2)
+p=ggplot(data.frame(x,y),aes(x,y))
+p+geom_point(size=3,alpha=0.8,
+             aes(colour=factor(result),
+               shape=zy_dbz_jl$诊断加术式))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
